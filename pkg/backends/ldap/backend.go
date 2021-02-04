@@ -18,12 +18,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"github.com/go-ldap/ldap"
-	jwtclaims "github.com/greenpau/caddy-auth-jwt/pkg/claims"
-	jwtconfig "github.com/greenpau/caddy-auth-jwt/pkg/config"
-	"github.com/greenpau/go-identity"
-
-	"go.uber.org/zap"
 	"io/ioutil"
 	"net"
 	"net/url"
@@ -32,6 +26,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-ldap/ldap"
+	jwtclaims "github.com/greenpau/caddy-auth-jwt/pkg/claims"
+	jwtconfig "github.com/greenpau/caddy-auth-jwt/pkg/config"
+	identity "github.com/greenpau/go-identity"
+	"go.uber.org/zap"
 )
 
 var (
@@ -143,8 +143,8 @@ func (sa *Authenticator) ConfigureServers(servers []AuthServer) error {
 		return fmt.Errorf("no authentication servers found")
 	}
 	for _, entry := range servers {
-		if !strings.HasPrefix(entry.Address, "ldaps://") {
-			return fmt.Errorf("the server address does not have ldaps:// prefix, address: %s", entry.Address)
+		if !(strings.HasPrefix(entry.Address, "ldap://") || strings.HasPrefix(entry.Address, "ldaps://")) {
+			return fmt.Errorf("the server address does not have ldap(s):// prefix, address: %s", entry.Address)
 		}
 		if entry.Timeout == 0 {
 			entry.Timeout = 5
@@ -165,7 +165,12 @@ func (sa *Authenticator) ConfigureServers(servers []AuthServer) error {
 		}
 		server.URL = url
 		if server.URL.Port() == "" {
-			server.Port = "636"
+			if strings.HasPrefix(entry.Address, "ldaps://") {
+				server.Port = "636"
+			}
+			if strings.HasPrefix(entry.Address, "ldap://") {
+				server.Port = "389"
+			}
 		} else {
 			server.Port = server.URL.Port()
 		}
@@ -309,65 +314,95 @@ func (sa *Authenticator) AuthenticateUser(userInput, passwordInput string) (*jwt
 	for _, server := range sa.servers {
 		timeout := time.Duration(server.Timeout) * time.Second
 
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: server.IgnoreCertErrors,
-		}
-		if sa.rootCAs != nil {
-			tlsConfig.RootCAs = sa.rootCAs
-		}
+		var ldapConnection *ldap.Conn
+		if strings.HasPrefix(server.Address, "ldaps://") {
+			tlsConfig := &tls.Config{
+				InsecureSkipVerify: server.IgnoreCertErrors,
+			}
+			if sa.rootCAs != nil {
+				tlsConfig.RootCAs = sa.rootCAs
+			}
 
-		ldapDialer, err := tls.DialWithDialer(
-			&net.Dialer{
-				Timeout: timeout,
-			},
-			"tcp",
-			net.JoinHostPort(server.URL.Hostname(), server.Port),
-			tlsConfig,
-		)
-		if err != nil {
-			sa.logger.Error(
-				"LDAP TLS dialer failed",
-				zap.String("server", server.Address),
-				zap.String("error", err.Error()),
+			ldapDialer, err := tls.DialWithDialer(
+				&net.Dialer{
+					Timeout: timeout,
+				},
+				"tcp",
+				net.JoinHostPort(server.URL.Hostname(), server.Port),
+				tlsConfig,
 			)
-			continue
-		}
+			if err != nil {
+				sa.logger.Error(
+					"LDAP TLS dialer failed",
+					zap.String("server", server.Address),
+					zap.String("error", err.Error()),
+				)
+				continue
+			}
 
-		sa.logger.Debug(
-			"LDAP TLS dialer setup succeeded",
-			zap.String("server", server.Address),
-		)
-
-		ldapConnection := ldap.NewConn(ldapDialer, true)
-		if ldapConnection == nil {
-			sa.logger.Error(
-				"LDAP connection failed",
+			sa.logger.Debug(
+				"LDAP TLS dialer setup succeeded",
 				zap.String("server", server.Address),
-				zap.String("error", err.Error()),
 			)
-			continue
-		}
-		// defer ldapConnection.Close()
 
-		tlsState, ok := ldapConnection.TLSConnectionState()
+			ldapConnection = ldap.NewConn(ldapDialer, true)
+			if ldapConnection == nil {
+				sa.logger.Error(
+					"LDAP connection failed",
+					zap.String("server", server.Address),
+					zap.String("error", err.Error()),
+				)
+				continue
+			}
+			// defer ldapConnection.Close()
 
-		if !ok {
-			sa.logger.Error(
-				"LDAP connection TLS state polling failed",
+			tlsState, ok := ldapConnection.TLSConnectionState()
+
+			if !ok {
+				sa.logger.Error(
+					"LDAP connection TLS state polling failed",
+					zap.String("server", server.Address),
+					zap.String("error", "TLSConnectionState is not ok"),
+				)
+				continue
+			}
+
+			sa.logger.Debug(
+				"LDAP connection TLS state polling succeeded",
 				zap.String("server", server.Address),
-				zap.String("error", "TLSConnectionState is not ok"),
+				zap.String("server_name", tlsState.ServerName),
+				zap.Bool("handshake_complete", tlsState.HandshakeComplete),
+				zap.String("version", fmt.Sprintf("%d", tlsState.Version)),
+				zap.String("negotiated_protocol", tlsState.NegotiatedProtocol),
 			)
-			continue
-		}
+		} else {
+			ldapDialer := &net.Dialer{Timeout: timeout}
+			tcpConn, err := ldapDialer.Dial("tcp", net.JoinHostPort(server.URL.Hostname(), server.Port))
+			if err != nil {
+				sa.logger.Error(
+					"LDAP TCP dialer failed",
+					zap.String("server", server.Address),
+					zap.String("error", err.Error()),
+				)
+				continue
+			}
 
-		sa.logger.Debug(
-			"LDAP connection TLS state polling succeeded",
-			zap.String("server", server.Address),
-			zap.String("server_name", tlsState.ServerName),
-			zap.Bool("handshake_complete", tlsState.HandshakeComplete),
-			zap.String("version", fmt.Sprintf("%d", tlsState.Version)),
-			zap.String("negotiated_protocol", tlsState.NegotiatedProtocol),
-		)
+			sa.logger.Debug(
+				"LDAP TCP dialer setup succeeded",
+				zap.String("server", server.Address),
+			)
+
+			ldapConnection = ldap.NewConn(tcpConn, false)
+			if ldapConnection == nil {
+				sa.logger.Error(
+					"LDAP connection failed",
+					zap.String("server", server.Address),
+					zap.String("error", err.Error()),
+				)
+				continue
+			}
+			// defer ldapConnection.Close()
+		}
 
 		ldapConnection.Start()
 		defer ldapConnection.Close()
